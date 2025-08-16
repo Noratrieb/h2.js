@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import { EventEmitter } from "node:events";
 
 const buildHuffmanTree = (values) => {
   const root = [];
@@ -420,8 +421,11 @@ class HPackCtx {
         if (huffman) {
           return decodeHuffman(length);
         } else {
+          const s = new TextDecoder().decode(
+            block.subarray(size, size + length)
+          );
           size += length;
-          return new TextDecoder().decode(block.subarray(size, length));
+          return s;
         }
       };
 
@@ -465,8 +469,35 @@ class HPackCtx {
 
     return fields;
   };
-  encode = () => {};
+  encode = (fields) => {
+    let block = Buffer.from([]);
+
+    // TODO: squimsh the bytes
+    for (const field of fields) {
+      // let's just pick 6.2.1. Literal Header Field with Incremental Indexing
+      block = Buffer.concat([block, Buffer.from([64])]);
+
+      const encodeString = (s) => {
+        const length = s.length;
+        if (length > 126) {
+          throw new Error("long header not implemented");
+        }
+        block = Buffer.concat([block, Buffer.from([length /*huffman false*/])]);
+        block = Buffer.concat([block, new TextEncoder().encode(s)]);
+      };
+
+      encodeString(field[0]);
+      encodeString(field[1]);
+    }
+
+    return block;
+  };
 }
+
+const reverseMap = (c) =>
+  Object.fromEntries(Object.entries(c).map(([k, v]) => [v, k]));
+
+const FRAME_HEADER_SIZE = 3 + 1 + 1 + 4;
 
 const FRAME_TYPE = {
   DATA: 0x0,
@@ -480,9 +511,7 @@ const FRAME_TYPE = {
   WINDOW_UPDATE: 0x08,
   CONTINUATION: 0x09,
 };
-const FRAME_TYPE_NAME = Object.fromEntries(
-  Object.entries(FRAME_TYPE).map(([k, v]) => [v, k])
-);
+const FRAME_TYPE_NAME = reverseMap(FRAME_TYPE);
 
 const SETTING = {
   SETTINGS_HEADER_TABLE_SIZE: 0x01,
@@ -492,10 +521,15 @@ const SETTING = {
   SETTINGS_MAX_FRAME_SIZE: 0x05,
   SETTINGS_MAX_HEADER_LIST_SIZE: 0x06,
 };
-const SETTING_NAME = Object.fromEntries(
-  Object.entries(SETTING).map(([k, v]) => [v, k])
-);
-const FRAME_HEADER_SIZE = 3 + 1 + 1 + 4;
+const SETTING_NAME = reverseMap(SETTING);
+
+const HEADERS_FLAG = {
+  END_HEADERS: 0x04,
+  END_STREAM: 0x01,
+  PRIORITY: 0x20,
+  PADDED: 0x08,
+};
+const HEADERS_FLAG_NAME = reverseMap(HEADERS_FLAG);
 
 const frameReader = (frameCb) => {
   const STATE = {
@@ -604,7 +638,12 @@ const encodeFrame = (frame) => {
     throw new Error(`Frame flags do not fit in a byte: ${frame.flags}`);
   }
   buffer[4] = frame.flags;
-  buffer.writeUint32BE(length, 5);
+  if (typeof frame.streamIdentifier !== "number") {
+    throw new Error(
+      `Frame stream identifier is not a number: ${frame.streamIdentifier}`
+    );
+  }
+  buffer.writeUint32BE(frame.streamIdentifier, 5);
 
   frame.payload.copy(buffer, FRAME_HEADER_SIZE);
 
@@ -612,150 +651,307 @@ const encodeFrame = (frame) => {
 };
 
 /**
- * @param {net.Socket} socket
+ * @typedef Request
+ * @type {object}
+ * @property {string} method
  */
-const handleConnection = (socket) => {
-  const peer = `${socket.remoteAddress}:${socket.remotePort}`;
 
-  console.log(`received connection from ${peer}`);
+/**
+ * @typedef Response
+ * @type {object}
+ * @property {number} status
+ */
 
-  const hpackDecode = new HPackCtx();
-  const hpackEncode = new HPackCtx();
-  const peerSettings = new Map();
-  const streams = new Map();
-
-  socket.write(
-    encodeFrame({
-      type: FRAME_TYPE.SETTINGS,
-      flags: 0,
-      payload: Buffer.from([]),
-    })
-  );
-
-  const onData = frameReader((err, frame) => {
-    if (err) {
-      console.warn("error from frame layer", err);
-      socket.destroy();
-      return;
+const buildRequest = (rawH2Request) => {
+  const getField = (name) => {
+    const fields = rawH2Request.fields.filter((f) => f[0] === name);
+    if (fields.length === 0) {
+      return undefined;
     }
-    console.log("received frame", FRAME_TYPE_NAME[frame.type], frame);
+    if (fields.length === 1) {
+      return fields[0][1];
+    }
+    return fields.map((f) => f[1]).join(", ");
+  };
 
-    switch (frame.type) {
-      case FRAME_TYPE.HEADERS: {
-        if (!streams.has(frame.streamIdentifier)) {
-          streams.set(frame.streamIdentifier, {
-            headerBuffer: Buffer.from([]),
-            endHeaders: false,
-          });
-        }
+  const method = getField(":method");
+  if (!method) {
+    return {
+      ok: false,
+      error: "Missing :method",
+    };
+  }
+  const scheme = getField(":scheme");
+  if (!scheme) {
+    return {
+      ok: false,
+      error: "Missing :scheme",
+    };
+  }
+  const authority = getField(":authority");
+  if (!scheme) {
+    return {
+      ok: false,
+      error: "Missing :scheme",
+    };
+  }
+  const path = getField(":path");
+  if (!path) {
+    return {
+      ok: false,
+      error: "Missing :path",
+    };
+  }
 
-        // END_HEADERS
-        if ((frame.flags & 0x04) !== 0) {
-          streams.get(frame.streamIdentifier).endHeaders = true;
-        }
+  return {
+    ok: true,
+    request: {
+      method,
+      authority,
+      path,
+      scheme,
+      headers: rawH2Request.fields
+        .filter((f) => !f[0].startsWith(":"))
+        .map(([name, value]) => [name.toLowerCase(), value]),
+      peer: rawH2Request.peer,
+    },
+  };
+};
 
-        // PRIORITY
-        const priorityFlag = (frame.flags & 0x20) !== 0;
-        // PADDED
-        const paddedFlag = (frame.flags & 0x08) !== 0;
+/**
+ * @param {Response} response
+ */
+const serializeResponseFieldBlock = (fields) => {};
 
-        let payload = frame.payload;
+/**
+ * @param {EventEmitter} server
+ */
+const handleConnection =
+  (server) =>
+  /**
+   *
+   * @param {net.Socket} socket
+   */
+  (socket) => {
+    const peer = `${socket.remoteAddress}:${socket.remotePort}`;
 
-        let paddingLength = 0;
-        if (paddedFlag) {
-          paddingLength = payload[0];
-          payload = payload.subarray(1);
-        }
+    console.log(`received connection from ${peer}`);
 
-        if (priorityFlag) {
-          // skip over Exclusive/Stream Dependency, Weight
-          payload = payload.subarray(5);
-        }
+    const hpackDecode = new HPackCtx();
+    const hpackEncode = new HPackCtx();
+    const peerSettings = new Map();
+    const streams = new Map();
 
-        if (paddedFlag) {
-          if (paddingLength > payload.length) {
-            console.warn("too much padding");
-            socket.destroy();
-            return;
-          }
-          payload = payload.subarray(0, payload.length - paddingLength);
-        }
+    socket.write(
+      encodeFrame({
+        type: FRAME_TYPE.SETTINGS,
+        flags: 0,
+        streamIdentifier: 0,
+        payload: Buffer.from([]),
+      })
+    );
 
-        if (streams.get(frame.streamIdentifier).endHeaders) {
-          const fieldBlockFragement = payload;
-          const fields = hpackDecode.decode(fieldBlockFragement);
-
-          console.log("headers", fields);
-
-          // we got a request!!!
-        } else {
-          throw new Error("expecting CONTINUATION is not yet supported");
-        }
-
-        break;
+    const onData = frameReader((err, frame) => {
+      if (err) {
+        console.warn("error from frame layer", err);
+        socket.destroy();
+        return;
       }
-      case FRAME_TYPE.SETTINGS: {
-        // ACK
-        if ((frame.flags & 0x1) !== 0) {
-          if (frame.length !== 0) {
-            console.warn("received non-empty SETTINGS ack frame");
-            socket.destroy();
-            return;
+      console.log("received frame", FRAME_TYPE_NAME[frame.type], frame);
+
+      switch (frame.type) {
+        case FRAME_TYPE.HEADERS: {
+          if (!streams.has(frame.streamIdentifier)) {
+            streams.set(frame.streamIdentifier, {
+              headerBuffer: Buffer.from([]),
+              endHeaders: false,
+            });
+          }
+
+          // END_HEADERS
+          if ((frame.flags & HEADERS_FLAG.END_HEADERS) !== 0) {
+            streams.get(frame.streamIdentifier).endHeaders = true;
+          }
+
+          // PRIORITY
+          const priorityFlag = (frame.flags & HEADERS_FLAG.PRIORITY) !== 0;
+          // PADDED
+          const paddedFlag = (frame.flags & HEADERS_FLAG.PADDED) !== 0;
+
+          let payload = frame.payload;
+
+          let paddingLength = 0;
+          if (paddedFlag) {
+            paddingLength = payload[0];
+            payload = payload.subarray(1);
+          }
+
+          if (priorityFlag) {
+            // skip over Exclusive/Stream Dependency, Weight
+            payload = payload.subarray(5);
+          }
+
+          if (paddedFlag) {
+            if (paddingLength > payload.length) {
+              console.warn("too much padding");
+              socket.destroy();
+              return;
+            }
+            payload = payload.subarray(0, payload.length - paddingLength);
+          }
+
+          if (streams.get(frame.streamIdentifier).endHeaders) {
+            const fieldBlockFragement = payload;
+            const fields = hpackDecode.decode(fieldBlockFragement);
+
+            console.log("headers", fields);
+
+            const rawH2Request = {
+              peer: {
+                address: socket.remoteAddress,
+                port: socket.remotePort,
+              },
+              fields,
+            };
+
+            const request = buildRequest(rawH2Request);
+
+            // friends, we got a request!
+
+            if (false && request.ok) {
+              server.emit("request", request.request);
+            } else {
+              const responseBlock = hpackEncode.encode([
+                [":status", "400"],
+                ["date", new Date().toUTCString()],
+                ["server", "h2.js"],
+              ]);
+
+              socket.write(
+                encodeFrame({
+                  type: FRAME_TYPE.HEADERS,
+                  flags: HEADERS_FLAG.END_STREAM | HEADERS_FLAG.END_HEADERS,
+                  streamIdentifier: frame.streamIdentifier,
+                  payload: responseBlock,
+                })
+              );
+            }
+          } else {
+            throw new Error("expecting CONTINUATION is not yet supported");
           }
 
           break;
         }
+        case FRAME_TYPE.SETTINGS: {
+          // ACK
+          if ((frame.flags & 0x1) !== 0) {
+            if (frame.length !== 0) {
+              console.warn("received non-empty SETTINGS ack frame");
+              socket.destroy();
+              return;
+            }
 
-        if (frame.streamIdentifier !== 0) {
-          console.warn("stream identifier for a SETTINGS");
-          socket.destroy();
-          return;
+            break;
+          }
+
+          if (frame.streamIdentifier !== 0) {
+            console.warn("stream identifier for a SETTINGS");
+            socket.destroy();
+            return;
+          }
+          if (frame.length % 6 !== 0) {
+            console.warn("invalid length for SETTINGS frame");
+            socket.destroy();
+            return;
+          }
+
+          for (let i = 0; i < frame.length; i += 6) {
+            const identifier = frame.payload.readUint16BE(i);
+            const value = frame.payload.readUint32BE(i + 2);
+            console.log(
+              "SETTINGS setting",
+              SETTING_NAME[identifier],
+              "=",
+              value
+            );
+
+            peerSettings[SETTING_NAME[identifier]] = value;
+          }
+
+          break;
         }
-        if (frame.length % 6 !== 0) {
-          console.warn("invalid length for SETTINGS frame");
-          socket.destroy();
-          return;
+        case FRAME_TYPE.WINDOW_UPDATE: {
+          // whatever
+          const increment = frame.payload.readUint32BE();
+          console.log("incrementing transfer window by", increment);
+          break;
         }
-
-        for (let i = 0; i < frame.length; i += 6) {
-          const identifier = frame.payload.readUint16BE(i);
-          const value = frame.payload.readUint32BE(i + 2);
-          console.log("SETTINGS setting", SETTING_NAME[identifier], "=", value);
-
-          peerSettings[SETTING_NAME[identifier]] = value;
+        default: {
+          console.warn(
+            `unsupported frame type ${
+              FRAME_TYPE_NAME[frame.type] ?? frame.type
+            }`
+          );
         }
-
-        break;
       }
-      case FRAME_TYPE.WINDOW_UPDATE: {
-        // whatever
-        const increment = frame.payload.readUint32BE();
-        console.log("incrementing transfer window by", increment);
-        break;
-      }
-      default: {
-        console.warn(
-          `unsupported frame type ${FRAME_TYPE_NAME[frame.type] ?? frame.type}`
-        );
-      }
-    }
-  });
+    });
 
-  socket.on("data", onData);
+    socket.on("data", onData);
 
-  socket.on("error", (err) => {
-    console.warn(`error from ${peer}:`, err);
-  });
+    socket.on("error", (err) => {
+      server.emit("error", err);
+    });
 
-  socket.on("close", () => {
-    console.log(`connection closed for ${peer}`);
-  });
+    socket.on("close", () => {
+      server.emit("close");
+    });
+  };
+
+/**
+ * @callback onConnectionCallback
+ * @param {net.Socket} socket
+ * @returns {void}
+ */
+
+/**
+ * @typedef Http2ServerReturn
+ * @type {object}
+ * @property {EventEmitter} server
+ * @property {onConnectionCallback} onConnection
+ */
+
+/**
+ * @returns {Http2ServerReturn}
+ */
+export const createH2Server = () => {
+  const server = new EventEmitter();
+
+  return {
+    server,
+    onConnection: handleConnection(server),
+  };
 };
 
-const server = net.createServer(handleConnection).on("error", (err) => {
+const { server, onConnection } = createH2Server();
+
+server.on(
+  "request",
+  /**
+   * @param {Request} request
+   */
+  (request) => {
+    console.log(request);
+  }
+);
+
+server.on("error", (err) => {
+  console.log("error", err);
+});
+
+const tcpServer = net.createServer(onConnection).on("error", (err) => {
   console.error(`error: ${err}`);
 });
 
-server.listen(8080, () => {
-  console.log("Listening on", server.address());
+tcpServer.listen(8080, () => {
+  console.log("Listening on", tcpServer.address());
 });
