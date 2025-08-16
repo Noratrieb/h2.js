@@ -971,6 +971,11 @@ const handleConnection =
               const payload = Buffer.from(body);
               const h2stream = streams.get(frame.streamIdentifier);
 
+              if (!h2stream) {
+                setImmediate(cb);
+                return;
+              }
+
               const doWrite = () => {
                 h2stream.flowControlWindowSize -= payload.length;
 
@@ -1117,6 +1122,36 @@ const handleConnection =
 
           break;
         }
+        case FRAME_TYPE.RST_STREAM: {
+          const errorCode = frame.payload.readUint32BE();
+
+          if (frame.streamIdentifier === 0) {
+            socket.destroy();
+          }
+
+          streams.delete(frame.streamIdentifier);
+
+          if (debug) {
+            console.log("stream reset because of", ERROR_CODE_NAME[errorCode]);
+          }
+
+          break;
+        }
+        case FRAME_TYPE.PING: {
+          if (frame.streamIdentifier !== 0) {
+            socket.destroy();
+          }
+
+          socket.write(
+            encodeFrame({
+              type: FRAME_TYPE.PING,
+              flags: 0x01, // ACK
+              streamIdentifier: 0,
+              payload: frame.payload,
+            })
+          );
+          break;
+        }
         case FRAME_TYPE.WINDOW_UPDATE: {
           // whatever
           const increment = frame.payload.readUint32BE();
@@ -1202,6 +1237,8 @@ export const createH2Server = () => {
 
 const { server, onConnection } = createH2Server();
 
+const rootPath = process.env.ROOT_PATH ?? ".";
+
 server.on(
   "request",
   /**
@@ -1215,9 +1252,39 @@ server.on(
       res.writeHead({ status: 405 });
     }
 
-    const filepath = path.join(".", path.normalize(req.path));
+    const filepath = path.join(rootPath, path.normalize(req.path));
 
     console.log("opening", filepath);
+
+    const serveFile = (filepath, size) => {
+      const contentType =
+        {
+          ".html": "text/html; charset=utf-8",
+          ".css": "text/css; charset=utf-8",
+          ".js": "text/javascript; charset=utf-8",
+          ".png": "image/png",
+          ".jpg": "image/jpeg",
+          ".jpeg": "image/jpeg",
+          ".webp": "image/webp",
+          ".avif": "image/avif",
+          ".svg": "image/svg+xml",
+          ".woff": "font/woff",
+          ".woff2": "font/woff2",
+          ".txt": "text/plain",
+        }[path.extname(filepath)] ?? "application/octet-stream";
+
+      res.writeHead({
+        status: 200,
+        contentLength: size,
+        headers: [["content-type", contentType]],
+      });
+
+      const fileStream = fs.createReadStream(filepath, {
+        highWaterMark: 1_048_576,
+      });
+
+      fileStream.pipe(res.body);
+    };
 
     fs.stat(filepath, (err, stat) => {
       if (err) {
@@ -1231,69 +1298,54 @@ server.on(
       }
 
       if (stat.isDirectory()) {
-        fs.readdir(filepath, (err, files) => {
+        const indexhtml = path.join(filepath, "index.html");
+        fs.stat(indexhtml, (err, stat) => {
           if (err) {
-            console.error("failed to read dir", err);
-            res.writeHead({ status: 500 });
+            if (err.code === "ENOENT") {
+              fs.readdir(filepath, (err, files) => {
+                if (err) {
+                  console.error("failed to read dir", err);
+                  res.writeHead({ status: 500 });
+                  return;
+                }
+
+                const html = `<ul>${files
+                  .map(
+                    (file) =>
+                      `<li><a href="${encodeURIComponent(
+                        file
+                      )}">${file}</a></li>`
+                  )
+                  .join("\n")}</ul>`;
+
+                res.writeHead({
+                  status: 200,
+                  contentLength: html.length,
+                  headers: [["content-type", "text/html; charset=utf-8"]],
+                });
+                res.body.write(html);
+                res.body.end();
+              });
+              return;
+            } else {
+              console.error("failed to stat index.html", err);
+              res.writeHead({ status: 500 });
+            }
             return;
           }
 
-          const html = `<ul>${files
-            .map(
-              (file) =>
-                `<li><a href="${encodeURIComponent(file)}">${file}</a></li>`
-            )
-            .join("\n")}</ul>`;
-
-          res.writeHead({
-            status: 200,
-            contentLength: html.length,
-            headers: [["content-type", "text/html; charset=utf-8"]],
-          });
-          res.body.write(html);
-          res.body.end();
+          if (stat.isFile()) {
+            serveFile(indexhtml, stat.size);
+          } else {
+            console.error(`${indexhtml} exists but is not a regular file`);
+            res.writeHead({ status: 500 });
+          }
         });
         return;
       }
 
       if (stat.isFile()) {
-        fs.open(filepath, (err, fd) => {
-          if (err) {
-            console.error("failed to read", err);
-            res.writeHead({ status: 500 });
-
-            return;
-          }
-
-          const size = stat.size;
-
-          const contentType =
-            {
-              ".html": "text/html; charset=utf-8",
-              ".css": "text/css; charset=utf-8",
-              ".js": "text/javascript; charset=utf-8",
-              ".png": "image/png",
-              ".jpg": "image/jpeg",
-              ".jpeg": "image/jpeg",
-              ".webp": "image/webp",
-              ".avif": "image/avif",
-              ".woff": "font/woff",
-              ".woff2": "font/woff2",
-              ".txt": "text/plain",
-            }[path.extname(filepath)] ?? "application/octet-stream";
-
-          res.writeHead({
-            status: 200,
-            contentLength: size,
-            headers: [["content-type", contentType]],
-          });
-
-          const fileStream = fs.createReadStream(filepath, {
-            highWaterMark: 1_048_576,
-          });
-
-          fileStream.pipe(res.body);
-        });
+        serveFile(filepath, stat.size);
         return;
       }
 
