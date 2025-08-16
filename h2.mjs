@@ -850,10 +850,7 @@ const buildRequest = (rawH2Request) => {
   };
 };
 
-/**
- * @param {Response} response
- */
-const serializeResponseFieldBlock = (fields) => {};
+const DEFAULT_FLOW_CONTROL_WINDOW_SIZE = 65535;
 
 /**
  * @param {EventEmitter} server
@@ -871,6 +868,7 @@ const handleConnection =
 
     const hpackDecode = new HPackCtx();
     const hpackEncode = new HPackCtx();
+    let connectionFlowControlWindow = DEFAULT_FLOW_CONTROL_WINDOW_SIZE;
     const peerSettings = new Map();
     const streams = new Map();
 
@@ -910,6 +908,9 @@ const handleConnection =
             streams.set(frame.streamIdentifier, {
               headerBuffer: Buffer.from([]),
               endHeaders: false,
+              flowControlWindowSize:
+                peerSettings.get(SETTING.SETTINGS_INITIAL_WINDOW_SIZE) ??
+                DEFAULT_FLOW_CONTROL_WINDOW_SIZE,
             });
           }
 
@@ -966,6 +967,21 @@ const handleConnection =
 
             const request = buildRequest(rawH2Request);
 
+            const writeData = (body, flags) => {
+              const payload = Buffer.from(body);
+              streams.get(frame.streamIdentifier).flowControlWindowSize -=
+                payload.length;
+
+              socket.write(
+                encodeFrame({
+                  type: FRAME_TYPE.DATA,
+                  flags: flags,
+                  payload,
+                  streamIdentifier: frame.streamIdentifier,
+                })
+              );
+            };
+
             /**
              * @type {ResponseWriter}
              */
@@ -999,24 +1015,10 @@ const handleConnection =
                 );
               },
               bodyPart: (body) => {
-                socket.write(
-                  encodeFrame({
-                    type: FRAME_TYPE.DATA,
-                    flags: 0,
-                    payload: Buffer.from(body),
-                    streamIdentifier: frame.streamIdentifier,
-                  })
-                );
+                writeData(body, 0);
               },
               end: (body) => {
-                socket.write(
-                  encodeFrame({
-                    type: FRAME_TYPE.DATA,
-                    flags: DATA_FLAG.END_STREAM,
-                    payload: Buffer.from(body),
-                    streamIdentifier: frame.streamIdentifier,
-                  })
-                );
+                writeData(body, DATA_FLAG.END_STREAM);
               },
             };
 
@@ -1081,7 +1083,8 @@ const handleConnection =
         }
         case FRAME_TYPE.WINDOW_UPDATE: {
           // whatever
-          // const increment = frame.payload.readUint32BE();
+          const increment = frame.payload.readUint32BE();
+          console.log(increment, frame.streamIdentifier);
           break;
         }
         case FRAME_TYPE.GOAWAY: {
