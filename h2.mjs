@@ -1,5 +1,9 @@
 import * as net from "node:net";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import path from "node:path";
+
+const debug = process.env.DEBUG?.includes("h2.js");
 
 const buildHuffmanTree = (values) => {
   const root = [];
@@ -285,8 +289,6 @@ const HUFFMAN_TREE = buildHuffmanTree([
 ]);
 
 class HPackCtx {
-  #dynamicTable;
-
   static #STATIC_TABLE = {
     1: [":authority", ""],
     2: [":method", "GET"],
@@ -350,16 +352,42 @@ class HPackCtx {
     60: ["via", ""],
     61: ["www-authenticate", ""],
   };
-  static #STATIC_TABLE_MAX = 61;
+  static #STATIC_TABLE_MAX = 62;
+
+  #maxDynamicTableLength;
+  #dynamicTable;
 
   constructor() {
-    this.#dynamicTable = {};
+    this.#dynamicTable = [];
+    this.#maxDynamicTableLength = 4096;
   }
 
   #indexTable = (index) => {
-    return index < HPackCtx.#STATIC_TABLE_MAX
-      ? HPackCtx.#STATIC_TABLE[index]
-      : this.#dynamicTable[index - HPackCtx.#STATIC_TABLE_MAX];
+    const value =
+      index < HPackCtx.#STATIC_TABLE_MAX
+        ? HPackCtx.#STATIC_TABLE[index]
+        : this.#dynamicTable[index - HPackCtx.#STATIC_TABLE_MAX];
+
+    if (!value) {
+      throw new Error(`Failed to find index in HPACK tables ${index}`);
+    }
+
+    return value;
+  };
+
+  #insertDynamicTable = (value) => {
+    this.#dynamicTable.splice(0, 0, value);
+
+    let tableSize = 0;
+    const tooBigIndex = this.#dynamicTable.findIndex((entry) => {
+      const entrySize = entry[0].length + entry[1].lenght + 32;
+      tableSize += entrySize;
+      return tableSize > this.#maxDynamicTableLength;
+    });
+
+    if (tooBigIndex !== -1) {
+      this.#dynamicTable.length = tooBigIndex;
+    }
   };
 
   decode = (block) => {
@@ -376,12 +404,25 @@ class HPackCtx {
       let field;
 
       const decodeInteger = (mask) => {
-        const int = block[size] & (0xff >> mask);
+        let int = block[size] & (0xff >> mask);
+
+        size += 1;
 
         if (int === 0xff >> mask) {
-          throw new Error("long integer, todo");
+          // large int
+
+          let next;
+          let m = 0;
+
+          do {
+            next = block[size++];
+            const val = next & 0b0111_1111;
+            int = int + val * 2 ** m;
+            m += 7;
+          } while (next & 0b1000_0000);
+
+          return int;
         }
-        size += 1;
         return int;
       };
 
@@ -432,7 +473,6 @@ class HPackCtx {
       // Indexed Header Field Representation
       if (firstBit) {
         const index = decodeInteger(1);
-
         const tabled = this.#indexTable(index);
 
         field = tabled;
@@ -451,8 +491,28 @@ class HPackCtx {
           const headerValue = decodeString();
 
           field = [headerName, headerValue];
+
+          this.#insertDynamicTable(field);
         } else {
-          throw new Error("some other encoding");
+          if (thirdBit) {
+            throw new Error("dynamic thing");
+          } else {
+            // Literal Header Field Never Indexed
+            // Literal Header Field without Indexing
+
+            const index = decodeInteger(4);
+
+            let headerName;
+            if (index === 0) {
+              headerName = decodeString();
+            } else {
+              headerName = this.#indexTable(index)[0];
+            }
+
+            const headerValue = decodeString();
+
+            field = [headerName, headerValue];
+          }
         }
       }
 
@@ -474,6 +534,10 @@ class HPackCtx {
 
     // TODO: squimsh the bytes
     for (const field of fields) {
+      if (typeof field[0] !== "string" || typeof field[1] !== "string") {
+        throw new Error("invalid type of header");
+      }
+
       // let's just pick 6.2.1. Literal Header Field with Incremental Indexing
       block = Buffer.concat([block, Buffer.from([64])]);
 
@@ -499,6 +563,7 @@ const reverseMap = (c) =>
 
 const FRAME_HEADER_SIZE = 3 + 1 + 1 + 4;
 
+const PREFANCE_RECEIVED_FRAME_TYPE = Symbol("PREFACE_RECEIVED");
 const FRAME_TYPE = {
   DATA: 0x0,
   HEADERS: 0x1,
@@ -531,6 +596,31 @@ const HEADERS_FLAG = {
 };
 const HEADERS_FLAG_NAME = reverseMap(HEADERS_FLAG);
 
+const DATA_FLAG = {
+  PADDED: 0x08,
+  END_STREAM: 0x01,
+};
+
+const ERROR_CODE = {
+  NO_ERROR: 0,
+  PROTOCOL_ERROR: 0x01,
+  INTERNAL_ERROR: 0x02,
+  FLOW_CONTROL_ERROR: 0x03,
+  SETTINGS_TIMEOUT: 0x04,
+  STREAM_CLOSED: 0x05,
+  FRAME_SIZE_ERROR: 0x06,
+  REFUSED_STREAM: 0x07,
+  CANCEL: 0x08,
+  COMPRESSION_ERROR: 0x09,
+  CONNECT_ERROR: 0x0a,
+  ENHANCE_YOUR_CALM: 0x0b,
+  INADEQUATE_SECURITY: 0x0c,
+  HTTP_1_1_REQUIRED: 0x0d,
+};
+const ERROR_CODE_NAME = reverseMap(ERROR_CODE);
+
+class Http11Error extends Error {}
+
 const frameReader = (frameCb) => {
   const STATE = {
     PREFACE: 0,
@@ -558,9 +648,28 @@ const frameReader = (frameCb) => {
           const preface = buf.subarray(0, 24);
           buf = buf.subarray(24);
           if (Buffer.compare(preface, CONNECTION_PREFACE) !== 0) {
-            frameCb(new Error(`invalid preface from ${peer}`));
+            try {
+              const decoded = new TextDecoder().decode(preface);
+              if (
+                decoded.includes("HTTP/1.1") ||
+                /^(GET|POST|PUT|PATCH|DELETE|OPTIONS|TRACE) /.test(decoded)
+              ) {
+                frameCb(new Http11Error());
+              } else {
+                frameCb(new Error("invalid preface"));
+              }
+            } catch (e) {
+              frameCb(new Error("invalid preface"));
+            }
             return;
           }
+
+          frameCb(null, {
+            length: 0,
+            type: PREFANCE_RECEIVED_FRAME_TYPE,
+            flags: 0,
+            streamIdentifier: 0,
+          });
 
           state = STATE.FRAME_HEAD;
 
@@ -654,12 +763,32 @@ const encodeFrame = (frame) => {
  * @typedef Request
  * @type {object}
  * @property {string} method
+ * @property {string} path
+ * @property {URLSearchParams} query
+ * @property {URL} url
+ * @property {string[][]} headers
+ * @property {object} peer
  */
 
 /**
- * @typedef Response
+ * @typedef ResponseWriteHeaders
+ * @type {string[][]}
+ *
+ * @typedef ResponseWriteHeadParam
  * @type {object}
  * @property {number} status
+ * @property {ResponseWriteHeaders} headers
+ *
+ * @callback ResponseWriteHead
+ * @param {ResponseWriteHeadParam} head
+ *
+ * @callback ResponseWriteBody
+ * @param {Buffer|string} body
+ *
+ * @typedef ResponseWriter
+ * @type {object}
+ * @property {ResponseWriteHead} writeHead
+ * @property {ResponseWriteBody} body
  */
 
 const buildRequest = (rawH2Request) => {
@@ -703,13 +832,16 @@ const buildRequest = (rawH2Request) => {
     };
   }
 
+  // this is probably bad
+  const url = new URL(`${scheme}://${authority}${path}`);
+
   return {
     ok: true,
     request: {
       method,
-      authority,
-      path,
-      scheme,
+      path: url.pathname,
+      query: url.searchParams,
+      url,
       headers: rawH2Request.fields
         .filter((f) => !f[0].startsWith(":"))
         .map(([name, value]) => [name.toLowerCase(), value]),
@@ -742,24 +874,37 @@ const handleConnection =
     const peerSettings = new Map();
     const streams = new Map();
 
-    socket.write(
-      encodeFrame({
-        type: FRAME_TYPE.SETTINGS,
-        flags: 0,
-        streamIdentifier: 0,
-        payload: Buffer.from([]),
-      })
-    );
-
     const onData = frameReader((err, frame) => {
       if (err) {
+        if (err instanceof Http11Error) {
+          socket.write(
+            "HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\n\r\n"
+          );
+          socket.destroy();
+          return;
+        }
+
         console.warn("error from frame layer", err);
         socket.destroy();
         return;
       }
-      console.log("received frame", FRAME_TYPE_NAME[frame.type], frame);
+
+      if (debug) {
+        console.log("received frame", FRAME_TYPE_NAME[frame.type], frame);
+      }
 
       switch (frame.type) {
+        case PREFANCE_RECEIVED_FRAME_TYPE: {
+          socket.write(
+            encodeFrame({
+              type: FRAME_TYPE.SETTINGS,
+              flags: 0,
+              streamIdentifier: 0,
+              payload: Buffer.from([]),
+            })
+          );
+          break;
+        }
         case FRAME_TYPE.HEADERS: {
           if (!streams.has(frame.streamIdentifier)) {
             streams.set(frame.streamIdentifier, {
@@ -802,9 +947,14 @@ const handleConnection =
 
           if (streams.get(frame.streamIdentifier).endHeaders) {
             const fieldBlockFragement = payload;
-            const fields = hpackDecode.decode(fieldBlockFragement);
-
-            console.log("headers", fields);
+            let fields;
+            try {
+              fields = hpackDecode.decode(fieldBlockFragement);
+            } catch (e) {
+              console.warn("failed to decode HPACK block", e);
+              socket.destroy();
+              return;
+            }
 
             const rawH2Request = {
               peer: {
@@ -816,25 +966,69 @@ const handleConnection =
 
             const request = buildRequest(rawH2Request);
 
+            /**
+             * @type {ResponseWriter}
+             */
+            const resWriter = {
+              writeHead: (param) => {
+                const hasBody = param.contentLength;
+
+                const responseBlock = hpackEncode.encode([
+                  [":status", String(param.status)],
+                  ...(hasBody
+                    ? [["content-length", String(param.contentLength)]]
+                    : []),
+                  ...(param.headers
+                    ? param.headers.filter(
+                        (h) =>
+                          !h[0].startsWith(":") &&
+                          h[0].toLowerCase() !== "content-length"
+                      )
+                    : []),
+                ]);
+
+                socket.write(
+                  encodeFrame({
+                    type: FRAME_TYPE.HEADERS,
+                    flags:
+                      HEADERS_FLAG.END_HEADERS |
+                      (hasBody ? 0 : HEADERS_FLAG.END_STREAM),
+                    streamIdentifier: frame.streamIdentifier,
+                    payload: responseBlock,
+                  })
+                );
+              },
+              bodyPart: (body) => {
+                socket.write(
+                  encodeFrame({
+                    type: FRAME_TYPE.DATA,
+                    flags: 0,
+                    payload: Buffer.from(body),
+                    streamIdentifier: frame.streamIdentifier,
+                  })
+                );
+              },
+              end: (body) => {
+                socket.write(
+                  encodeFrame({
+                    type: FRAME_TYPE.DATA,
+                    flags: DATA_FLAG.END_STREAM,
+                    payload: Buffer.from(body),
+                    streamIdentifier: frame.streamIdentifier,
+                  })
+                );
+              },
+            };
+
             // friends, we got a request!
 
-            if (false && request.ok) {
-              server.emit("request", request.request);
+            if (request.ok) {
+              server.emit("request", request.request, resWriter);
             } else {
-              const responseBlock = hpackEncode.encode([
-                [":status", "400"],
-                ["date", new Date().toUTCString()],
-                ["server", "h2.js"],
-              ]);
-
-              socket.write(
-                encodeFrame({
-                  type: FRAME_TYPE.HEADERS,
-                  flags: HEADERS_FLAG.END_STREAM | HEADERS_FLAG.END_HEADERS,
-                  streamIdentifier: frame.streamIdentifier,
-                  payload: responseBlock,
-                })
-              );
+              resWriter.writeHead({
+                status: 400,
+                headers: [["date", new Date().toUTCString()]],
+              });
             }
           } else {
             throw new Error("expecting CONTINUATION is not yet supported");
@@ -868,22 +1062,37 @@ const handleConnection =
           for (let i = 0; i < frame.length; i += 6) {
             const identifier = frame.payload.readUint16BE(i);
             const value = frame.payload.readUint32BE(i + 2);
-            console.log(
-              "SETTINGS setting",
-              SETTING_NAME[identifier],
-              "=",
-              value
-            );
-
+            if (debug) {
+              console.log(
+                "SETTINGS setting",
+                SETTING_NAME[identifier],
+                "=",
+                value
+              );
+            }
             peerSettings[SETTING_NAME[identifier]] = value;
+
+            if (identifier === SETTING.SETTINGS_HEADER_TABLE_SIZE) {
+              throw new Error("cannot change table size yet");
+            }
           }
 
           break;
         }
         case FRAME_TYPE.WINDOW_UPDATE: {
           // whatever
-          const increment = frame.payload.readUint32BE();
-          console.log("incrementing transfer window by", increment);
+          // const increment = frame.payload.readUint32BE();
+          break;
+        }
+        case FRAME_TYPE.GOAWAY: {
+          const errorCode = frame.payload.readUint32BE(4);
+
+          if (debug) {
+            console.log("goaway with code", ERROR_CODE_NAME[errorCode]);
+          }
+
+          socket.destroy();
+
           break;
         }
         default: {
@@ -937,10 +1146,113 @@ const { server, onConnection } = createH2Server();
 server.on(
   "request",
   /**
-   * @param {Request} request
+   * @param {Request} req
+   * @param {ResponseWriter} res
    */
-  (request) => {
-    console.log(request);
+  (req, res) => {
+    console.log("received a request", req.method, req.path);
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead({ status: 405 });
+    }
+
+    const filepath = path.join(".", path.normalize(req.path));
+
+    console.log("opening", filepath);
+
+    fs.stat(filepath, (err, stat) => {
+      if (err) {
+        if (err.code === "ENOENT") {
+          res.writeHead({ status: 404 });
+        } else {
+          console.error("failed to open", err);
+          res.writeHead({ status: 500 });
+        }
+        return;
+      }
+
+      if (stat.isDirectory()) {
+        fs.readdir(filepath, (err, files) => {
+          if (err) {
+            console.error("failed to read dir", err);
+            res.writeHead({ status: 500 });
+            return;
+          }
+
+          const html = `<ul>${files
+            .map(
+              (file) =>
+                `<li><a href="${encodeURIComponent(file)}">${file}</a></li>`
+            )
+            .join("\n")}</ul>`;
+
+          res.writeHead({
+            status: 200,
+            contentLength: html.length,
+            headers: [["content-type", "text/html; charset=utf-8"]],
+          });
+          res.end(html);
+        });
+        return;
+      }
+
+      if (stat.isFile()) {
+        fs.open(filepath, (err, fd) => {
+          if (err) {
+            console.error("failed to read", err);
+            res.writeHead({ status: 500 });
+
+            return;
+          }
+
+          const size = stat.size;
+
+          const contentType =
+            {
+              ".html": "text/html; charset=utf-8",
+              ".css": "text/css; charset=utf-8",
+              ".js": "text/javascript; charset=utf-8",
+              ".png": "image/png",
+              ".jpg": "image/jpeg",
+              ".jpeg": "image/jpeg",
+              ".webp": "image/webp",
+              ".avif": "image/avif",
+              ".woff": "font/woff",
+              ".woff2": "font/woff2",
+              ".txt": "text/plain",
+            }[path.extname(filepath)] ?? "application/octet-stream";
+
+          res.writeHead({
+            status: 200,
+            contentLength: size,
+            headers: [["content-type", contentType]],
+          });
+
+          let remainingSize = size;
+
+          const readDataPart = () =>
+            fs.read(fd, (err, bytesRead, buffer) => {
+              if (err) {
+                console.error("error reading from file", err);
+                res.end("");
+              }
+
+              remainingSize -= bytesRead;
+              if (remainingSize === 0) {
+                res.end(buffer.subarray(0, bytesRead));
+              } else {
+                res.bodyPart(buffer.subarray(0, bytesRead));
+                readDataPart();
+              }
+            });
+          readDataPart();
+        });
+        return;
+      }
+
+      console.log(`File ${filepath} is neither a directory nor regular file`);
+      res.writeHead({ status: 404 });
+    });
   }
 );
 

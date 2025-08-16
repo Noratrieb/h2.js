@@ -1,0 +1,5 @@
+# caddy run --config Caddyfile
+
+http://localhost:8081 {
+	reverse_proxy * h2c://localhost:8080
+}
